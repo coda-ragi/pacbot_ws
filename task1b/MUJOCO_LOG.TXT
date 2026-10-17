@@ -1,0 +1,2 @@
+ERROR Mon Oct  5 00:06:51 2026: Could not connect to MQTT broker at localhost:1883
+

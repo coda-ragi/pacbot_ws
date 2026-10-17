@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
+Task 1A: PacBot Path Planning with A*
 """
 
 import json
+import heapq
 import time
 
 import paho.mqtt.client as mqtt
@@ -31,38 +33,6 @@ WALLS = [
     [10, 10, 9, 6, 10, 12, 2, 8, 1, 7, 12, 0, 2],
     [9, 1, 5, 1, 1, 3, 8, 1, 5, 5, 3, 9, 3],
 ]
-# Maze map -- the same data as WALLS above, drawn. row 0 = SOUTH (bottom),
-# col 0 = WEST (left). The gaps in the top and bottom edges are EXIT_CELLS.
-#
-#            0  1  2  3  4  5  6  7  8  9 10 11 12   <- col
-#          +--+--+--+--+--+--+  +--+--+--+--+--+--+
-#   row 12 |                 |              |     |
-#          +  +  +--+  +  +  +  +  +--+--+  +  +  +
-#   row 11 |  |  |     |  |     |        |        |
-#          +  +  +  +--+  +--+  +  +  +--+--+  +  +
-#   row 10 |           |     |     |  |        |  |
-#          +  +  +--+--+--+  +--+--+  +  +  +  +  +
-#   row  9 |  |           |        |        |     |
-#          +--+  +  +  +  +--+  +  +--+--+  +--+--+
-#   row  8 |     |  |  |        |                 |
-#          +  +--+  +  +--+  +  +--+--+  +  +  +  +
-#   row  7 |        |     |  |     |     |     |  |
-#          +  +  +  +--+  +  +--+  +  +  +--+--+  +
-#   row  6 |  |           |  |     |  |           |
-#          +  +--+--+  +--+  +  +--+  +  +--+--+  +
-#   row  5 |     |           |        |  |        |
-#          +  +  +  +--+--+--+  +  +--+  +  +--+  +
-#   row  4 |  |  |        |     |  |     |  |  |  |
-#          +  +  +  +--+  +--+  +  +  +--+  +  +  +
-#   row  3 |  |        |              |        |  |
-#          +  +--+--+  +--+  +--+  +--+  +--+  +  +
-#   row  2 |        |        |     |     |     |  |
-#          +  +--+  +  +  +--+  +  +  +--+--+  +  +
-#   row  1 |  |  |  |  |     |     |           |  |
-#          +  +  +  +  +--+  +  +  +--+  +  +--+  +
-#   row  0 |     |     |                 |        |
-#          +--+--+--+--+--+--+  +--+--+--+--+--+--+
-#            0  1  2  3  4  5  6  7  8  9 10 11 12   <- col
 
 # the 2 known exits: (row, col, facing)
 EXIT_CELLS = [
@@ -82,15 +52,153 @@ HEADING_DELTA = {
     270.0: (-1, 0, WALL_S),
 }
 
+DELTA_TO_YAW = {
+    (0, 1): 0.0,
+    (1, 0): 90.0,
+    (0, -1): 180.0,
+    (-1, 0): 270.0,
+}
+
+EXIT_FACING_YAW = {
+    'east': 0.0,
+    'north': 90.0,
+    'west': 180.0,
+    'south': 270.0,
+}
+
 
 # ============================================================================
 # YOUR ALGORITHM GOES HERE. Everything above and below is plumbing.
 # ============================================================================
-def choose_command(pacbot_cell, pacbot_yaw, pellets_remaining):
-    """FRONT/LEFT/RIGHT/BACK to send now, or None. pacbot_cell=(row,col),
-    pacbot_yaw one of HEADING_DELTA's keys, pellets_remaining=set of
-    (row,col). Implement this -- see EXIT_CELLS above for the 2 exits."""
+
+def heuristic(cell_a, cell_b):
+    """Manhattan distance heuristic for grid navigation."""
+    return abs(cell_a[0] - cell_b[0]) + abs(cell_a[1] - cell_b[1])
+
+
+def get_neighbors(cell):
+    """Returns valid reachable neighbor cells based on maze walls."""
+    r, c = cell
+    neighbors = []
+    cell_wall_mask = WALLS[r][c]
+
+    for yaw, (dr, dc, wall_bit) in HEADING_DELTA.items():
+        # Check if there is a wall blocking this direction in current cell
+        if not (cell_wall_mask & wall_bit):
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < MAZE_ROWS and 0 <= nc < MAZE_COLS:
+                neighbors.append((nr, nc))
+    return neighbors
+
+
+def a_star_search(start_cell, goal_cell):
+    """
+    Computes the shortest coordinate path from start_cell to goal_cell using A*.
+    Returns a list of coordinates [(r0, c0), (r1, c1), ...] or None if unreachable.
+    """
+    if start_cell == goal_cell:
+        return [start_cell]
+
+    open_set = []
+    heapq.heappush(open_set, (0, start_cell))
+    
+    came_from = {}
+    g_score = {start_cell: 0}
+
+    while open_set:
+        _, current = heapq.heappop(open_set)
+
+        if current == goal_cell:
+            # Reconstruct path
+            path = [current]
+            while current in came_from:
+                current = came_from[current]
+                path.append(current)
+            path.reverse()
+            return path
+
+        for neighbor in get_neighbors(current):
+            tentative_g = g_score[current] + 1
+            if tentative_g < g_score.get(neighbor, float('inf')):
+                came_from[neighbor] = current
+                g_score[neighbor] = tentative_g
+                f_score = tentative_g + heuristic(neighbor, goal_cell)
+                heapq.heappush(open_set, (f_score, neighbor))
+
     return None
+
+
+def get_relative_turn_command(current_yaw, target_yaw):
+    """
+    Converts current orientation and desired absolute heading into
+    robot commands: 'FRONT', 'LEFT', 'RIGHT', 'BACK'.
+    """
+    turn_diff = (target_yaw - current_yaw) % 360.0
+
+    if turn_diff == 0.0:
+        return "FRONT"
+    elif turn_diff == 90.0:
+        return "LEFT"
+    elif turn_diff == 180.0:
+        return "BACK"
+    elif turn_diff == 270.0:
+        return "RIGHT"
+    return "FRONT"
+
+
+def choose_command(pacbot_cell, pacbot_yaw, pellets_remaining):
+    """
+    FRONT/LEFT/RIGHT/BACK to send now, or None. 
+    pacbot_cell=(row,col), pacbot_yaw one of HEADING_DELTA's keys,
+    pellets_remaining=set of (row,col).
+    """
+    # 1. Select the next target
+    if pellets_remaining:
+        # Find the shortest A* path among all remaining pellets
+        best_path = None
+        for pellet in pellets_remaining:
+            path = a_star_search(pacbot_cell, pellet)
+            if path and (best_path is None or len(path) < len(best_path)):
+                best_path = path
+
+        if best_path is None or len(best_path) < 2:
+            return None
+
+        # Determine target yaw to enter the next cell
+        next_cell = best_path[1]
+        dr = next_cell[0] - pacbot_cell[0]
+        dc = next_cell[1] - pacbot_cell[1]
+        desired_yaw = DELTA_TO_YAW[(dr, dc)]
+
+        return get_relative_turn_command(pacbot_yaw, desired_yaw)
+
+    # 2. All pellets collected: Navigate to the nearest exit
+    best_exit_path = None
+    target_exit_meta = None
+
+    for exit_row, exit_col, facing in EXIT_CELLS:
+        exit_cell = (exit_row, exit_col)
+        path = a_star_search(pacbot_cell, exit_cell)
+        if path and (best_exit_path is None or len(path) < len(best_exit_path)):
+            best_exit_path = path
+            target_exit_meta = (exit_cell, facing)
+
+    if best_exit_path is None:
+        return None
+
+    # Bot is in transit to the exit cell
+    if len(best_exit_path) > 1:
+        next_cell = best_exit_path[1]
+        dr = next_cell[0] - pacbot_cell[0]
+        dc = next_cell[1] - pacbot_cell[1]
+        desired_yaw = DELTA_TO_YAW[(dr, dc)]
+        return get_relative_turn_command(pacbot_yaw, desired_yaw)
+
+    # Bot has arrived at the exit cell: Turn/Step out through the exit
+    exit_cell, facing = target_exit_meta
+    desired_yaw = EXIT_FACING_YAW[facing]
+    return get_relative_turn_command(pacbot_yaw, desired_yaw)
+
 # ============================================================================
 
 
